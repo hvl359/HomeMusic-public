@@ -92,6 +92,7 @@ export function MorePage() {
             right={<Switch on={smart} />}
           />
         )}
+        <Item icon="history" to="/history" title="История прослушивания" sub="Ваши треки по времени воспроизведения" />
         <Item icon="upload" to="/upload" title="Загрузить файлы" sub="Свои аудиофайлы с телефона" />
         <Item icon="playlist" to="/playlists" title="Плейлисты" sub="Ваши плейлисты в Navidrome" />
         <Item icon="transfer" to="/import" title="Перенести музыку" sub="Из Яндекс Музыки и Spotify: ♥, плейлисты, альбомы" />

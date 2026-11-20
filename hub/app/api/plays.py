@@ -5,15 +5,15 @@ from __future__ import annotations
 from datetime import date
 from zoneinfo import ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import plays
 from app.api.schemas import DislikeIn, DislikeOut, PlayEventRejected, PlayEventsIn, PlayEventsOut
 from app.auth import current_user
 from app.db import get_session
-from app.models import Dislike, User
+from app.models import Dislike, PlayEvent, Track, User, utcnow
 
 router = APIRouter(tags=["plays"])
 
@@ -98,3 +98,40 @@ async def remove_one(dislike_id: int, user: User = Depends(current_user),
                               client="pwa", target_type="artist" if d.artist_ref else "track")
     await s.delete(d)
     return {"removed": 1}
+
+
+@router.get("/api/plays/history")
+async def listening_history(response: Response, limit: int = Query(50, ge=1, le=100),
+                            offset: int = Query(0, ge=0, le=100000),
+                            user: User = Depends(current_user),
+                            s: AsyncSession = Depends(get_session, scope="function")):
+    """Personal playback attempts, newest first; checkpoints are not separate listens."""
+    response.headers["Cache-Control"] = "no-store"
+    grouped = (PlayEvent.playback_id.is_not(None) & PlayEvent.device_id.is_not(None))
+    ranked = select(PlayEvent.id.label("id"), func.row_number().over(
+        partition_by=(case((grouped, PlayEvent.device_id)),
+                      case((grouped, PlayEvent.playback_id)),
+                      case((~grouped, PlayEvent.id))),
+        order_by=(PlayEvent.ts.desc(), PlayEvent.id.desc())).label("rank")).where(
+            PlayEvent.user_id == user.id, PlayEvent.target_type == "track",
+            PlayEvent.kind.in_(("start", "progress", "skip", "finish", "interrupted", "error")),
+            PlayEvent.superseded_scrobble.is_(False), PlayEvent.ts <= utcnow()).subquery()
+    rows = list((await s.execute(select(PlayEvent).join(ranked, ranked.c.id == PlayEvent.id)
+        .where(ranked.c.rank == 1).order_by(PlayEvent.ts.desc(), PlayEvent.id.desc())
+        .offset(offset).limit(limit + 1))).scalars())
+    ids = {r.nd_song_id for r in rows if r.nd_song_id}
+    tracks = {t.nd_song_id: t for t in (await s.execute(select(Track).where(
+        Track.nd_song_id.in_(ids)).order_by(Track.id))).scalars()} if ids else {}
+    items = []
+    for row in rows[:limit]:
+        meta = row.track_metadata or {}
+        track = tracks.get(row.nd_song_id)
+        artists = meta.get("artists") or []
+        artist = ", ".join(a["name"] for a in artists if a.get("name"))
+        items.append({"id": row.id, "ts": row.ts.isoformat() + "Z", "kind": row.kind, "client": row.client,
+                      "ref": row.ref, "nd_song_id": row.nd_song_id,
+                      "title": meta.get("title") or (track.title if track else None),
+                      "artist": artist or (track.artist if track else None),
+                      "duration_s": row.duration_s or (track.duration_s if track else None),
+                      "listened_ms": row.listened_ms})
+    return {"items": items, "next_offset": offset + limit if len(rows) > limit else None}

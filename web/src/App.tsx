@@ -26,6 +26,7 @@ import { AssistantChatsPage, AssistantPage } from './pages/Assistant';
 import { AssistantTaskPage } from './pages/AssistantTask';
 import { DownloadDetailPage } from './pages/DownloadDetail';
 import { DownloadsPage } from './pages/Downloads';
+import { HistoryPage } from './pages/History';
 import { HomePage } from './pages/Home';
 import { ImportItemsPage, ImportPage, ImportsPage } from './pages/Import';
 import { LibraryPage } from './pages/Library';
@@ -89,6 +90,7 @@ const ROUTES: RouteDef[] = [
       />
     ),
   ],
+  ['/history', 'more', () => <HistoryPage />],
   ['/more', 'more', () => <MorePage />],
   ['/admin', 'more', () => <AdminPage />],
   ['/admin/user/:id', 'more', (p) => <AdminUserPage key={p.id} id={Number(p.id)} />],
