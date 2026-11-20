@@ -424,6 +424,7 @@ async def test_scrobble_dedup_preserves_synthetic_likes_and_bounds_future(env):
 
 async def test_favorites_sync_still_runs_when_scrobble_import_fails(env, monkeypatch):
     from unittest.mock import AsyncMock
+
     from app import favorites, plays
     monkeypatch.setattr(plays, "import_scrobbles", AsyncMock(side_effect=TimeoutError()))
     sync = AsyncMock(return_value=0)
@@ -683,3 +684,53 @@ async def test_launch_fields_are_stored_and_never_change_the_taste(env):
         await s.execute(update(PlayEvent).values(launch_id=None, launch_origin=None))
     without = await taste()
     assert with_launch[0].tracks and with_launch == without
+
+
+async def test_history_groups_checkpoints_keeps_replays_and_paginates(env):
+    c = env["client"]
+    now = datetime.now(UTC) - timedelta(minutes=1)
+    for playback in ("first", "second"):
+        await post(c, ev("start", at=now, ref="dz:100", device_id="phone", playback_id=playback, listened_ms=0),
+                   ev("progress", at=now + timedelta(seconds=1), ref="dz:100", device_id="phone",
+                      playback_id=playback, listened_ms=1000))
+    response = await c.get("/api/plays/history?limit=1")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    data = response.json()
+    assert len(data["items"]) == 1 and data["next_offset"] == 1
+    item = data["items"][0]
+    assert item["title"] == "Группа крови" and item["artist"] == "Кино"
+    assert item["listened_ms"] == 1000 and item["kind"] == "progress"
+    second = (await c.get("/api/plays/history?limit=1&offset=1")).json()
+    assert len(second["items"]) == 1 and second["next_offset"] is None
+    assert item["id"] != second["items"][0]["id"]
+    assert (await c.get("/api/plays/history?limit=0")).status_code == 422
+    assert (await c.get("/api/plays/history?offset=-1")).status_code == 422
+
+
+async def test_history_is_private_and_excludes_nonplays_and_superseded(env):
+    from app.db import session_scope
+    from app.models import PlayEvent, User
+    c = env["client"]
+    await post(c, ev("start", ref="dz:100"), ev("like", ref="dz:100"))
+    async with session_scope() as s:
+        original = (await s.execute(select(PlayEvent).where(PlayEvent.kind == "start"))).scalar_one()
+        original.superseded_scrobble = True
+        other = User(nd_username="history-other", nd_password_enc="unused")
+        s.add(other)
+        await s.flush()
+        s.add(PlayEvent(user_id=other.id, event_id="private-history", ts=now_naive(),
+                        kind="start", ref="dz:100", client="pwa"))
+        s.add(PlayEvent(user_id=original.user_id, event_id="future-history", ts=utc_future(),
+                        kind="start", ref="dz:100", client="pwa"))
+    assert (await c.get("/api/plays/history")).json()["items"] == []
+    await c.post("/api/auth/logout")
+    assert (await c.get("/api/plays/history")).status_code == 401
+
+
+def utc_future():
+    return (datetime.now(UTC) + timedelta(days=1)).replace(tzinfo=None)
+
+
+def now_naive():
+    return datetime.now(UTC).replace(tzinfo=None)
