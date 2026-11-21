@@ -147,6 +147,18 @@ let audio: HTMLAudioElement | null = null;
 
 /** The page player's `<audio>` (null until the first track): `lib/waveAudio.ts` reads its loudness. */
 export const listenAudio = (): HTMLAudioElement | null => audio;
+type Recovery = { retries: number; stage: 'original' | 'next' | 'fallback' };
+let lastSuccessful: ListenTrack | null = null;
+let playbackFailure: ((message: string) => void) | null = null;
+let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+function clearRecoveryTimer() {
+  clearTimeout(recoveryTimer);
+  recoveryTimer = undefined;
+}
+function watchPlayback() {
+  clearRecoveryTimer();
+  recoveryTimer = setTimeout(() => playbackFailure?.('Превышено время ожидания воспроизведения'), 30_000);
+}
 let pendingSeek = 0;
 let resolving: AbortController | null = null;
 let prefetching: { ref: string; ctl: AbortController } | null = null;
@@ -313,6 +325,8 @@ function el(): HTMLAudioElement {
   a.addEventListener('durationchange', sync);
   a.addEventListener('play', pauseNative);
   a.addEventListener('playing', () => {
+    clearRecoveryTimer();
+    lastSuccessful = state.track;
     set({ phase: 'playing', error: null });
     refreshInfo();
     reportStart();
@@ -325,15 +339,19 @@ function el(): HTMLAudioElement {
   });
   a.addEventListener('waiting', () => {
     suspendClock();
-    if (state.phase === 'playing') set({ phase: 'loading' });
+    if (state.phase === 'playing') { set({ phase: 'loading' }); watchPlayback(); }
   });
   // Pauses from outside (audio focus, lock screen); switching tracks also fires one, during 'resolving'.
   a.addEventListener('pause', () => {
+    if (resolving?.signal.aborted) return;
+    clearRecoveryTimer();
     suspendClock();
     if (!a.ended && (state.phase === 'playing' || state.phase === 'loading')) set({ phase: 'paused' });
   });
   // the same element plays on: it was unlocked by the first tap, so the next track may start without one
   a.addEventListener('ended', () => {
+    clearRecoveryTimer();
+    playbackFailure = null;
     reportEnd(true);
     if (state.repeat === 'one') start(state.queue, state.index, true);
     else if (hasNext(state)) start(state.queue, state.index + 1, true);
@@ -341,7 +359,7 @@ function el(): HTMLAudioElement {
     else set({ phase: 'ended' });
   });
   a.addEventListener('error', () => {
-    if (a.getAttribute('src')) { reportEnd(false, true); set({ phase: 'error', error: state.error ?? 'Не удалось воспроизвести' }); }
+    if (a.getAttribute('src') && a.error) playbackFailure?.('Не удалось воспроизвести');
   });
   // the app's player started: one player on screen, so this one closes (the app shows its own again)
   window.addEventListener(NATIVE_PLAYING_EVENT, stopListening);
@@ -351,13 +369,18 @@ function el(): HTMLAudioElement {
 
 function play(a: HTMLAudioElement) {
   // NotAllowedError (no user gesture): wait for the play button; AbortError: a newer track or a pause won.
+  const failure = playbackFailure;
   a.play().catch((e: unknown) => {
-    if ((e as Error)?.name === 'NotAllowedError') set({ phase: 'paused' });
+    if (failure !== playbackFailure) return;
+    if ((e as Error)?.name === 'NotAllowedError') { clearRecoveryTimer(); set({ phase: 'paused' }); }
+    else if ((e as Error)?.name !== 'AbortError') failure?.(errorMessage(e));
   });
 }
 
-/** `auto`: reached by the previous track ending; a track that can't be played is then skipped. */
-function start(queue: readonly ListenTrack[], index: number, auto = false, position = 0, autoplay = true) {
+/** Each failure chain is bounded: two retries, one next track, then the last audible track. */
+function start(queue: readonly ListenTrack[], index: number, auto = false, position = 0, autoplay = true, recovery: Recovery = { retries: 0, stage: 'original' }) {
+  clearRecoveryTimer();
+  playbackFailure = null;
   const track = queue[index];
   const a = el();
   reportEnd();
@@ -368,8 +391,33 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
   resolving = ctl;
   pendingSeek = position;
   set({ track, queue, index, context: listContext, phase: autoplay ? 'resolving' : 'paused', info: null, error: null, position, duration: track.duration_s ?? 0 });
+  let failed = false;
+  playbackFailure = (message) => {
+    if (failed || resolving !== ctl || ctl.signal.aborted || state.phase === 'paused') return;
+    failed = true;
+    clearRecoveryTimer();
+    reportEnd(false, true);
+    ctl.abort();
+    a.pause();
+    set({ phase: 'loading', error: null });
+    recoveryTimer = setTimeout(() => {
+      if (resolving !== ctl) return;
+      if (recovery.retries < 2) {
+        start(state.queue, state.index, auto, state.position, true, { ...recovery, retries: recovery.retries + 1 });
+      } else if (recovery.stage === 'original' && (hasNext(state) || (state.repeat === 'all' && !onWave() && state.queue.length > 1))) {
+        start(state.queue, hasNext(state) ? state.index + 1 : 0, true, 0, true, { retries: 2, stage: 'next' });
+      } else if (recovery.stage !== 'fallback' && lastSuccessful && lastSuccessful.ref !== track.ref) {
+        const at = state.queue.findIndex((t) => t.ref === lastSuccessful!.ref);
+        const queue = at >= 0 ? state.queue : [...state.queue, lastSuccessful];
+        start(queue, at >= 0 ? at : queue.length - 1, true, 0, true, { retries: 2, stage: 'fallback' });
+      } else {
+        playbackFailure = null;
+        set({ phase: 'error', error: message });
+      }
+    }, 1000);
+  };
   a.src = listenStreamUrl(track.ref);
-  if (autoplay) play(a);
+  if (autoplay) { watchPlayback(); play(a); }
   else a.load();
   mediaSession(track);
   // the prefetch of this very track (it was next) is the request to wait for: don't abort it
@@ -384,9 +432,7 @@ function start(queue: readonly ListenTrack[], index: number, auto = false, posit
     },
     (e: unknown) => {
       if (isAbort(e) || resolving !== ctl) return;
-      if (auto && hasNext(state)) return void start(state.queue, state.index + 1, true);
-      set({ phase: 'error', error: errorMessage(e) });
-      a.pause();
+      playbackFailure?.(errorMessage(e));
     },
   );
 }
@@ -806,14 +852,16 @@ function resume() {
   const a = audio;
   const track = state.track;
   if (!a || !track) return;
-  if (state.phase === 'error') return start(state.queue, state.index);
+  if (state.phase === 'error' || resolving?.signal.aborted) return start(state.queue, state.index);
   if (state.phase === 'ended') return start(state.queue, state.index);
   set({ phase: state.info || state.position ? 'loading' : 'resolving' });
+  watchPlayback();
   play(a);
 }
 
 export function pause() {
   if (!audio || !state.track || state.phase === 'error' || state.phase === 'ended') return;
+  clearRecoveryTimer();
   audio.pause();
   set({ phase: 'paused' });
 }
@@ -836,6 +884,9 @@ export function seek(seconds: number) {
 
 /** Stops and hides the player. */
 export function stopListening() {
+  clearRecoveryTimer();
+  playbackFailure = null;
+  lastSuccessful = null;
   reportEnd();
   resolving?.abort();
   resolving = null;
